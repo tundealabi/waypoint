@@ -1,0 +1,14 @@
+node_modules
+.expo
+dist
+ios
+android
+.vscode
+pnpm-lock.yaml
+*.png
+*.jpg
+*.webp
+*.ico
+waypoint.md
+docs/
+
