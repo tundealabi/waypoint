@@ -4,7 +4,7 @@ Shared itinerary, packing list, and trip expenses. Works offline. When people re
 
 The interesting part is one sync engine: SQLite, an outbox, field-level last-write-wins with hybrid logical clocks, the same path for packing items, itinerary stops, and expenses.
 
-Specs are ahead of the code. Product is [`waypoint.md`](waypoint.md). Engineering is [`docs/architecture.md`](docs/architecture.md). Screens are [`docs/ui.md`](docs/ui.md). The app in this repo is still the Expo template until we start building against those.
+Specs are ahead of the remaining phases. Product is [`waypoint.md`](waypoint.md). Engineering is [`docs/architecture.md`](docs/architecture.md). Screens are [`docs/ui.md`](docs/ui.md). Phase 1 UI (auth, trips, packing) is in the app; sync, itinerary, map, lock, widgets, and expenses are still later.
 
 ## Run it
 
