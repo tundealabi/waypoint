@@ -21,7 +21,7 @@ pnpm format
 pnpm check
 ```
 
-`pnpm check` is lint, Prettier check, and `tsc --noEmit`. A Husky pre-commit hook runs that before every commit.
+`pnpm check` is lint, Prettier check, `tsc --noEmit`, and unit tests. A Husky pre-commit hook runs that before every commit.
 
 Expo Go is fine for poking at the template. Maps, biometrics, widgets, and a real native module set need a development build. See the Expo [development builds](https://docs.expo.dev/develop/development-builds/introduction/) docs when we get there.
 

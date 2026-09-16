@@ -42,7 +42,7 @@ ESLint: `eslint-config-expo` flat config, Prettier as an ESLint rule, `simple-im
 
 Prettier: single quotes, print width 100, trailing comma es5.
 
-`pnpm check` is lint, Prettier check, `tsc --noEmit`. Husky pre-commit runs `pnpm check`.
+`pnpm check` is lint, Prettier check, `tsc --noEmit`, and unit tests. Husky pre-commit runs `pnpm check`.
 
 ## Sync engine
 
