@@ -41,7 +41,8 @@
         {
           "photosPermission": "Waypoint uses photos for optional trip covers."
         }
-      ]
+      ],
+      "expo-sqlite"
     ],
     "experiments": {
       "typedRoutes": true,

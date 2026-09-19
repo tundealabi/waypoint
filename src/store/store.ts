@@ -1,4 +1,24 @@
-import { addDaysIso, todayIso } from '@/lib/dates';
+import type { FieldWrite, SqliteDb } from '@/db';
+import {
+  deleteMemberRow,
+  DEMO_INVITE_TOKEN,
+  insertInvite,
+  insertMember,
+  insertTrip,
+  LISBON_ID,
+  loadPersisted,
+  markInviteUsed,
+  markTripDeleted,
+  ME_ID,
+  migrate,
+  seedIfEmpty,
+  setLocalArchive,
+  updateTripRow,
+  updateUserProfile,
+  writeFields,
+} from '@/db';
+import { openExpoDatabase } from '@/db/expo';
+import { PACKING_ENTITY_TYPE, positionBetween } from '@/sync';
 
 import { createId } from './ids';
 import { packingTemplates } from './templates';
@@ -12,108 +32,27 @@ import type {
   PackingTemplateId,
   Session,
   StoreState,
+  SyncStatus,
   Trip,
   TripDraft,
-  User,
   VerifyResult,
 } from './types';
 
-const ME_ID = 'user-me';
-const SAM_ID = 'user-sam';
-const LISBON_ID = 'trip-lisbon';
-const TOKYO_ID = 'trip-tokyo';
 const MAGIC_LINK_MS = 15 * 60 * 1000;
 const INVITE_MS = 7 * 24 * 60 * 60 * 1000;
-const DRAIN_MS = 650;
+const RESTORED = 'Item restored, it was edited after being deleted.';
 
-const me: User = { id: ME_ID, email: 'you@example.com', name: 'You' };
-const sam: User = { id: SAM_ID, email: 'sam@example.com', name: 'Sam' };
-
-function seedState(): StoreState {
-  const start = addDaysIso(todayIso(), 18);
-  const end = addDaysIso(start, 5);
-  const tokyoStart = addDaysIso(todayIso(), -40);
-  const tokyoEnd = addDaysIso(tokyoStart, 4);
-
-  const trips: Trip[] = [
-    {
-      id: LISBON_ID,
-      name: 'Lisbon with Sam',
-      destination: 'Lisbon, Portugal',
-      startDate: start,
-      endDate: end,
-      emoji: '🇵🇹',
-      ownerId: ME_ID,
-      archivedBy: {},
-      deleted: false,
-    },
-    {
-      id: TOKYO_ID,
-      name: 'Tokyo spring',
-      destination: 'Tokyo, Japan',
-      startDate: tokyoStart,
-      endDate: tokyoEnd,
-      emoji: '🇯🇵',
-      ownerId: ME_ID,
-      archivedBy: { [ME_ID]: true },
-      deleted: false,
-    },
-  ];
-
-  const members: Member[] = [
-    {
-      id: 'member-lisbon-me',
-      tripId: LISBON_ID,
-      userId: ME_ID,
-      role: 'owner',
-      email: me.email,
-      name: me.name,
-    },
-    {
-      id: 'member-lisbon-sam',
-      tripId: LISBON_ID,
-      userId: SAM_ID,
-      role: 'editor',
-      email: sam.email,
-      name: sam.name,
-    },
-    {
-      id: 'member-tokyo-me',
-      tripId: TOKYO_ID,
-      userId: ME_ID,
-      role: 'owner',
-      email: me.email,
-      name: me.name,
-    },
-  ];
-
-  const packingItems: PackingItem[] = [
-    item(LISBON_ID, 'Passport', 0, { packed: true, assigneeId: ME_ID }),
-    item(LISBON_ID, 'Phone charger', 1, { packed: true }),
-    item(LISBON_ID, 'Walking shoes', 2, { assigneeId: ME_ID }),
-    item(LISBON_ID, 'Light jacket', 3, { assigneeId: SAM_ID }),
-    item(LISBON_ID, 'Sunscreen', 4, { quantity: '1 bottle', assigneeId: SAM_ID }),
-    item(LISBON_ID, 'Adapter', 5, { note: 'EU plug' }),
-  ];
-
+function emptyState(): StoreState {
   return {
     session: null,
     pendingEmail: null,
     magicLink: null,
     pendingJoin: null,
-    users: [me, sam],
-    trips,
-    members,
-    invites: [
-      {
-        id: 'invite-lisbon',
-        tripId: LISBON_ID,
-        token: 'lisbon-demo',
-        expiresAt: Date.now() + INVITE_MS,
-        used: false,
-      },
-    ],
-    packingItems,
+    users: [],
+    trips: [],
+    members: [],
+    invites: [],
+    packingItems: [],
     pendingMutations: 0,
     syncStatus: 'synced',
     resurrectionMessage: null,
@@ -121,27 +60,10 @@ function seedState(): StoreState {
   };
 }
 
-function item(
-  tripId: string,
-  name: string,
-  position: number,
-  extra: Partial<PackingItem> = {}
-): PackingItem {
-  return {
-    id: createId(),
-    tripId,
-    name,
-    packed: false,
-    position,
-    deleted: false,
-    ...extra,
-  };
-}
-
-let state: StoreState = seedState();
-const listeners = new Set<() => void>();
-let drainTimer: ReturnType<typeof setTimeout> | null = null;
+let db: SqliteDb | null = null;
+let state: StoreState = emptyState();
 let online = true;
+const listeners = new Set<() => void>();
 
 function emit(): void {
   listeners.forEach((listener) => listener());
@@ -150,6 +72,41 @@ function emit(): void {
 function setState(patch: Partial<StoreState> | ((_current: StoreState) => StoreState)): void {
   state = typeof patch === 'function' ? patch(state) : { ...state, ...patch };
   emit();
+}
+
+function requireDb(): SqliteDb {
+  if (!db) {
+    hydrate();
+  }
+  if (!db) {
+    throw new Error('Database is not ready');
+  }
+  return db;
+}
+
+function syncStatusFor(pending: number): SyncStatus {
+  if (pending === 0) {
+    return 'synced';
+  }
+  return online ? 'syncing' : 'offline';
+}
+
+function reloadPersisted(): void {
+  const persisted = loadPersisted(requireDb());
+  setState({
+    ...persisted,
+    syncStatus: syncStatusFor(persisted.pendingMutations),
+  });
+}
+
+export function hydrate(injected?: SqliteDb): void {
+  if (db) {
+    return;
+  }
+  db = injected ?? openExpoDatabase();
+  migrate(db);
+  seedIfEmpty(db);
+  reloadPersisted();
 }
 
 export function subscribe(listener: () => void): () => void {
@@ -163,41 +120,7 @@ export function getState(): StoreState {
 
 export function setOnline(next: boolean): void {
   online = next;
-  if (next) {
-    if (state.pendingMutations > 0) {
-      setState({ syncStatus: 'syncing' });
-      scheduleDrain();
-    } else {
-      setState({ syncStatus: 'synced' });
-    }
-    return;
-  }
-  setState({
-    syncStatus: state.pendingMutations > 0 ? 'offline' : 'synced',
-  });
-}
-
-function noteLocalWrite(): void {
-  const pendingMutations = state.pendingMutations + 1;
-  if (online) {
-    setState({ pendingMutations, syncStatus: 'syncing' });
-    scheduleDrain();
-    return;
-  }
-  setState({ pendingMutations, syncStatus: 'offline' });
-}
-
-function scheduleDrain(): void {
-  if (drainTimer) {
-    clearTimeout(drainTimer);
-  }
-  drainTimer = setTimeout(() => {
-    drainTimer = null;
-    setState({
-      pendingMutations: 0,
-      syncStatus: online ? 'synced' : 'offline',
-    });
-  }, DRAIN_MS);
+  setState({ syncStatus: syncStatusFor(state.pendingMutations) });
 }
 
 function displayName(email: string): string {
@@ -231,18 +154,13 @@ export function signIn(email: string): Session {
   const normalized = email.trim().toLowerCase();
   const name = displayName(normalized);
   const session: Session = { userId: ME_ID, email: normalized, name };
-  setState((current) => ({
-    ...current,
+  updateUserProfile(requireDb(), ME_ID, normalized, name);
+  setState({
     session,
     pendingEmail: null,
     magicLink: null,
-    users: current.users.map((user) =>
-      user.id === ME_ID ? { ...user, email: normalized, name } : user
-    ),
-    members: current.members.map((member) =>
-      member.userId === ME_ID ? { ...member, email: normalized, name } : member
-    ),
-  }));
+  });
+  reloadPersisted();
   return session;
 }
 
@@ -252,8 +170,6 @@ export function signOut(): void {
     pendingEmail: null,
     magicLink: null,
     pendingJoin: null,
-    pendingMutations: 0,
-    syncStatus: 'synced',
     resurrectionMessage: null,
   });
 }
@@ -371,33 +287,16 @@ export function createTrip(draft: TripDraft): Trip {
     email: session.email,
     name: session.name,
   };
-  setState((current) => ({
-    ...current,
-    trips: [trip, ...current.trips],
-    members: [...current.members, member],
-  }));
-  noteLocalWrite();
+  const database = requireDb();
+  insertTrip(database, trip);
+  insertMember(database, member);
+  reloadPersisted();
   return trip;
 }
 
 export function updateTrip(tripId: string, draft: Partial<TripDraft>): void {
-  setState((current) => ({
-    ...current,
-    trips: current.trips.map((trip) =>
-      trip.id === tripId
-        ? {
-            ...trip,
-            name: draft.name?.trim() ?? trip.name,
-            destination: draft.destination?.trim() ?? trip.destination,
-            startDate: draft.startDate ?? trip.startDate,
-            endDate: draft.endDate ?? trip.endDate,
-            emoji: draft.emoji !== undefined ? draft.emoji.trim() || undefined : trip.emoji,
-            coverUri: draft.coverUri !== undefined ? draft.coverUri : trip.coverUri,
-          }
-        : trip
-    ),
-  }));
-  noteLocalWrite();
+  updateTripRow(requireDb(), tripId, draft);
+  reloadPersisted();
 }
 
 export function setTripArchived(tripId: string, archived: boolean): void {
@@ -405,22 +304,13 @@ export function setTripArchived(tripId: string, archived: boolean): void {
   if (!userId) {
     return;
   }
-  setState((current) => ({
-    ...current,
-    trips: current.trips.map((trip) =>
-      trip.id === tripId
-        ? { ...trip, archivedBy: { ...trip.archivedBy, [userId]: archived } }
-        : trip
-    ),
-  }));
+  setLocalArchive(requireDb(), tripId, userId, archived);
+  reloadPersisted();
 }
 
 export function deleteTrip(tripId: string): void {
-  setState((current) => ({
-    ...current,
-    trips: current.trips.map((trip) => (trip.id === tripId ? { ...trip, deleted: true } : trip)),
-  }));
-  noteLocalWrite();
+  markTripDeleted(requireDb(), tripId);
+  reloadPersisted();
 }
 
 export function createInvite(tripId: string): Invite {
@@ -437,7 +327,8 @@ export function createInvite(tripId: string): Invite {
     expiresAt: Date.now() + INVITE_MS,
     used: false,
   };
-  setState((current) => ({ ...current, invites: [...current.invites, invite] }));
+  insertInvite(requireDb(), invite);
+  reloadPersisted();
   return invite;
 }
 
@@ -488,14 +379,10 @@ export function joinTrip(tripId: string, token: string): JoinResult {
     email: session.email,
     name: session.name,
   };
-  setState((current) => ({
-    ...current,
-    members: [...current.members, member],
-    invites: current.invites.map((entry) =>
-      entry.id === invite.id ? { ...entry, used: true } : entry
-    ),
-  }));
-  noteLocalWrite();
+  const database = requireDb();
+  insertMember(database, member);
+  markInviteUsed(database, invite.id);
+  reloadPersisted();
   return { ok: true, tripId, alreadyMember: false };
 }
 
@@ -504,77 +391,118 @@ export function removeMember(tripId: string, memberId: string): void {
   if (!member || member.role === 'owner') {
     return;
   }
-  setState((current) => ({
-    ...current,
-    members: current.members.filter((entry) => entry.id !== memberId),
-    packingItems: current.packingItems.map((entry) =>
-      entry.assigneeId === member.userId ? { ...entry, assigneeId: undefined } : entry
-    ),
-  }));
-  noteLocalWrite();
+  const database = requireDb();
+  deleteMemberRow(database, memberId);
+  const assigned = state.packingItems.filter(
+    (entry) => entry.tripId === tripId && entry.assigneeId === member.userId && !entry.deleted
+  );
+  for (const item of assigned) {
+    writeFields(database, {
+      entityId: item.id,
+      tripId,
+      entityType: PACKING_ENTITY_TYPE,
+      changes: [{ field: 'assignee', value: null }],
+    });
+  }
+  reloadPersisted();
+}
+
+function commitPacking(
+  entityId: string,
+  tripId: string,
+  changes: FieldWrite[]
+): { resurrected: boolean } {
+  const result = writeFields(requireDb(), {
+    entityId,
+    tripId,
+    entityType: PACKING_ENTITY_TYPE,
+    changes,
+  });
+  reloadPersisted();
+  if (result.resurrected) {
+    setState({ resurrectionMessage: RESTORED });
+  }
+  return result;
 }
 
 export function addPackingItem(tripId: string, draft: PackingDraft): PackingItem {
-  const positions = getPackingItems(tripId).map((entry) => entry.position);
-  const packingItem: PackingItem = {
-    id: createId(),
-    tripId,
-    name: draft.name.trim(),
-    quantity: draft.quantity?.trim() || undefined,
-    note: draft.note?.trim() || undefined,
-    assigneeId: draft.assigneeId || undefined,
-    packed: false,
-    position: positions.length ? Math.max(...positions) + 1 : 0,
-    deleted: false,
-  };
-  setState((current) => ({ ...current, packingItems: [...current.packingItems, packingItem] }));
-  noteLocalWrite();
-  return packingItem;
+  const id = createId();
+  const ordered = getPackingItems(tripId);
+  const last = ordered.length ? ordered[ordered.length - 1]!.position : null;
+  const changes: FieldWrite[] = [
+    { field: 'name', value: draft.name.trim() },
+    { field: 'packed', value: false },
+    { field: 'position', value: positionBetween(last, null) },
+    { field: 'deleted', value: false },
+  ];
+  if (draft.quantity?.trim()) {
+    changes.push({ field: 'quantity', value: draft.quantity.trim() });
+  }
+  if (draft.note?.trim()) {
+    changes.push({ field: 'note', value: draft.note.trim() });
+  }
+  if (draft.assigneeId) {
+    changes.push({ field: 'assignee', value: draft.assigneeId });
+  }
+  commitPacking(id, tripId, changes);
+  const created = state.packingItems.find((entry) => entry.id === id);
+  if (!created) {
+    throw new Error('Failed to persist packing item');
+  }
+  return created;
 }
 
 export function applyPackingTemplate(tripId: string, templateId: PackingTemplateId): void {
   const existing = getPackingItems(tripId);
-  const min = existing.length ? Math.min(...existing.map((entry) => entry.position)) : 0;
-  const rows = packingTemplates[templateId].map((entry, index) =>
-    item(tripId, entry.name, min - packingTemplates[templateId].length + index, {
-      quantity: entry.quantity,
-    })
-  );
-  setState((current) => ({ ...current, packingItems: [...rows, ...current.packingItems] }));
-  noteLocalWrite();
+  let nextAfter = existing.length ? existing[0]!.position : null;
+  const rows = [...packingTemplates[templateId]].reverse();
+  for (const row of rows) {
+    const position = positionBetween(null, nextAfter);
+    nextAfter = position;
+    const changes: FieldWrite[] = [
+      { field: 'name', value: row.name },
+      { field: 'packed', value: false },
+      { field: 'position', value: position },
+      { field: 'deleted', value: false },
+    ];
+    if (row.quantity) {
+      changes.push({ field: 'quantity', value: row.quantity });
+    }
+    writeFields(requireDb(), {
+      entityId: createId(),
+      tripId,
+      entityType: PACKING_ENTITY_TYPE,
+      changes,
+    });
+  }
+  reloadPersisted();
 }
 
 export function updatePackingItem(
   id: string,
   draft: Partial<PackingDraft> & { packed?: boolean }
 ): void {
-  let resurrected = false;
-  setState((current) => ({
-    ...current,
-    packingItems: current.packingItems.map((entry) => {
-      if (entry.id !== id) {
-        return entry;
-      }
-      if (entry.deleted) {
-        resurrected = true;
-      }
-      return {
-        ...entry,
-        deleted: false,
-        name: draft.name?.trim() ?? entry.name,
-        quantity:
-          draft.quantity !== undefined ? draft.quantity.trim() || undefined : entry.quantity,
-        note: draft.note !== undefined ? draft.note.trim() || undefined : entry.note,
-        assigneeId:
-          draft.assigneeId !== undefined ? draft.assigneeId || undefined : entry.assigneeId,
-        packed: draft.packed ?? entry.packed,
-      };
-    }),
-    resurrectionMessage: resurrected
-      ? 'Item restored, it was edited after being deleted.'
-      : current.resurrectionMessage,
-  }));
-  noteLocalWrite();
+  const current = state.packingItems.find((entry) => entry.id === id);
+  if (!current) {
+    return;
+  }
+  const changes: FieldWrite[] = [];
+  if (draft.name !== undefined) {
+    changes.push({ field: 'name', value: draft.name.trim() });
+  }
+  if (draft.quantity !== undefined) {
+    changes.push({ field: 'quantity', value: draft.quantity.trim() || null });
+  }
+  if (draft.note !== undefined) {
+    changes.push({ field: 'note', value: draft.note.trim() || null });
+  }
+  if (draft.assigneeId !== undefined) {
+    changes.push({ field: 'assignee', value: draft.assigneeId || null });
+  }
+  if (draft.packed !== undefined) {
+    changes.push({ field: 'packed', value: draft.packed });
+  }
+  commitPacking(id, current.tripId, changes);
 }
 
 export function setPacked(id: string, packed: boolean): void {
@@ -582,44 +510,32 @@ export function setPacked(id: string, packed: boolean): void {
 }
 
 export function deletePackingItem(id: string): void {
-  setState((current) => ({
-    ...current,
-    packingItems: current.packingItems.map((entry) =>
-      entry.id === id ? { ...entry, deleted: true } : entry
-    ),
-  }));
-  noteLocalWrite();
+  const current = state.packingItems.find((entry) => entry.id === id);
+  if (!current) {
+    return;
+  }
+  commitPacking(id, current.tripId, [{ field: 'deleted', value: true }]);
 }
 
 export function movePackingItem(id: string, direction: -1 | 1): void {
   const target = state.packingItems.find((entry) => entry.id === id);
-  if (!target) {
+  if (!target || target.deleted) {
     return;
   }
   const ordered = getPackingItems(target.tripId);
   const index = ordered.findIndex((entry) => entry.id === id);
-  const swapWith = ordered[index + direction];
-  if (!swapWith) {
+  const neighbor = ordered[index + direction];
+  if (!neighbor) {
     return;
   }
-  const nextPosition = swapWith.position;
-  const currentPosition = ordered[index]!.position;
-  setState((current) => ({
-    ...current,
-    packingItems: current.packingItems.map((entry) => {
-      if (entry.id === id) {
-        return { ...entry, position: nextPosition };
-      }
-      if (entry.id === swapWith.id) {
-        return { ...entry, position: currentPosition };
-      }
-      return entry;
-    }),
-  }));
-  noteLocalWrite();
+  const position =
+    direction === 1
+      ? positionBetween(neighbor.position, ordered[index + 2]?.position ?? null)
+      : positionBetween(ordered[index - 2]?.position ?? null, neighbor.position);
+  commitPacking(id, target.tripId, [{ field: 'position', value: position }]);
 }
 
 export const DEMO_JOIN = {
   tripId: LISBON_ID,
-  token: 'lisbon-demo',
+  token: DEMO_INVITE_TOKEN,
 } as const;

@@ -6,9 +6,10 @@ import { useColorScheme } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import { useOnline } from '@/hooks';
-import { setOnline, useWaypoint } from '@/store';
+import { hydrate, setOnline, useWaypoint } from '@/store';
 
 SplashScreen.preventAutoHideAsync();
+hydrate();
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
